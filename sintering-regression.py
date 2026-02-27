@@ -53,17 +53,17 @@ SELECTED_FEATURES = [
 # Model selection (set to True to include in the evaluation)
 MODELS_TO_EVALUATE = {
     'Linear Regression': True,
-    'Ridge': False,
+    'Ridge': True,
     'Lasso': True,
     'ElasticNet': True,
-    'Decision Tree': False,
+    'Decision Tree': True,
     'Random Forest': True,
     'Gradient Boosting': True,
-    'XGBoost': False,
-    'SVR': False,
-    'KNN': False,
-    'MLP': False,
-    'GPR': False
+    'XGBoost': True,
+    'SVR': True,
+    'KNN': True,
+    'MLP': True,
+    'GPR': True
 }
 
 # Hyperparameter tuning settings
@@ -171,6 +171,17 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
     dropped_count = original_count - len(data)
     print(f"Dropped {dropped_count} rows with missing target values")
 
+    # --- NEW: Smooth the TARGET variable ---
+    # This forces the model to learn the trend, not the noise
+    print("Smoothing target variable to reduce noise...")
+    sg_window_target = 21  # Slightly larger window for target
+    sg_poly_target = 2
+    
+    # Apply smoothing per file to avoid jumps at file boundaries
+    data[target_col] = data.groupby('file_id')[target_col].transform(
+        lambda x: savgol_filter(x, window_length=sg_window_target, polyorder=sg_poly_target)
+    )
+    
     y = data[target_col].values
 
     data = data.replace(-999, np.nan)
@@ -228,6 +239,16 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
         data['AV Force'] = pd.to_numeric(data['AV Force'], errors='coerce').fillna(method='ffill')
         data['Force_x_Temp'] = data['AV Force'] * data['Pyrometer']
 
+    # D. NEW: Cumulative Energy (Integral of Power)
+    if 'Heating power' in data.columns:
+        data['Heating power'] = pd.to_numeric(data['Heating power'], errors='coerce').fillna(0)
+        # Calculate cumulative sum per file
+        data['Cumulative_Energy'] = data.groupby('file_id')['Heating power'].cumsum()
+        
+        if current_selected is not None:
+            if 'Cumulative_Energy' not in current_selected:
+                current_selected.append('Cumulative_Energy')
+
     # Add these new features to selected_features
     if current_selected is not None:
         new_features = ['Shrinkage_Rate', 'Heating_Rate', 'Pyrometer_Smooth', 'Force_x_Temp']
@@ -235,7 +256,7 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
             if feat in data.columns and feat not in current_selected:
                 current_selected.append(feat)
 
-    # D. Standard Rolling Means (kept for robustness)
+    # E. Standard Rolling Means (kept for robustness)
     dynamic_features_to_process = ['MTC1', 'SV Force']
     window_size_feat = 5
     for feature in dynamic_features_to_process:
