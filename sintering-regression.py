@@ -15,6 +15,9 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, Matern, WhiteKernel, ConstantKernel as C
 # Import tuning functionality from shared module
 from sintering_tuning import tune_hyperparameters, get_param_grids, ensure_finite
+# Import reporting functionality
+from sintering_reporting import save_model_artifacts, generate_pdf_report
+
 import xgboost as xgb
 import lightgbm as lgb
 import warnings
@@ -251,7 +254,8 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
 
     # Add these new features to selected_features
     if current_selected is not None:
-        new_features = ['Shrinkage_Rate', 'Heating_Rate', 'Pyrometer_Smooth', 'Force_x_Temp']
+        # REMOVED 'Shrinkage_Rate' from this list to prevent data leakage!
+        new_features = ['Heating_Rate', 'Pyrometer_Smooth', 'Force_x_Temp']
         for feat in new_features:
             if feat in data.columns and feat not in current_selected:
                 current_selected.append(feat)
@@ -1307,6 +1311,12 @@ def main():
             
         # Plot comparison of all models
         plot_model_comparison(y_val_window, all_predictions, APPROACH)
+        
+        # --- NEW: Save Model and Generate Report ---
+        print("\nSaving model artifacts and generating report...")
+        save_model_artifacts(best_model, scaler, window_feature_names)
+        generate_pdf_report(y_val_window, all_predictions, results, window_feature_names, best_model)
+        # -------------------------------------------
 
     elif APPROACH == 3:
         # Virtual experiment: similar to approach 2, but using predicted targets
@@ -1405,6 +1415,14 @@ def main():
             
         # Plot comparison of all models
         plot_model_comparison(all_true_values, all_predictions, APPROACH)
+        
+        # --- NEW: Save Model and Generate Report ---
+        print("\nSaving model artifacts and generating report...")
+        save_model_artifacts(best_model, scaler, window_feature_names)
+        # Note: For virtual experiment, we might want to report the virtual results, 
+        # but for now let's stick to the window approach results for consistency
+        generate_pdf_report(all_true_values, all_predictions, results, window_feature_names, best_model)
+        # -------------------------------------------
 
     else:
         raise ValueError(f"Unknown approach: {APPROACH}")
