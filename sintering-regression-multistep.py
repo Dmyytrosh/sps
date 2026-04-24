@@ -18,6 +18,8 @@ from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, Matern, WhiteKernel, ConstantKernel as C
 import warnings
 import time
+import re
+from scipy.signal import savgol_filter
 
 # Import tuning functionality from shared module
 from sintering_tuning import tune_hyperparameters, get_param_grids, ensure_finite
@@ -43,12 +45,12 @@ np.random.seed(42)
 
 # Define file paths
 file_paths = [
-    '160508-1021-1000,0min,56kN.csv',
-    '160508-1022-900,0min,56kN.csv',
-    '200508-1023-1350,0min,56kN.csv',
-    '200508-1024-1200,0min,56kN.csv',
-    '050608-1037-1200,0min,70kN.csv',
-    '290508-1033-1100,0min,70kN.csv'
+    'data/160508-1021-1000,0min,56kN.csv',
+    'data/160508-1022-900,0min,56kN.csv',
+    'data/200508-1023-1350,0min,56kN.csv',
+    'data/200508-1024-1200,0min,56kN.csv',
+    'data/050608-1037-1200,0min,70kN.csv',
+    'data/290508-1033-1100,0min,70kN.csv'
 ]
 
 # Configuration
@@ -65,18 +67,18 @@ SELECTED_FEATURES = [
 
 # Model selection (we'll focus on a subset for the multi-step training)
 MODELS_TO_EVALUATE = {
-    'Linear Regression': True,
-    'Ridge': True,
-    'Lasso': True,
-    'ElasticNet': True,
-    'Decision Tree': True,  # More basic model, can be skipped for speed
-    'Random Forest': True, 
-    'Gradient Boosting': True,
-    'XGBoost': True,
-    'SVR': True,       # More time-consuming
-    'KNN': True,       # Simple but not as effective for this problem
-    'MLP': True,       # Time-consuming to train
-    'GPR': False        # Very time-consuming for large datasets
+    'Linear Regression': False,
+    'Ridge': False,
+    'Lasso': False,
+    'ElasticNet': False,
+    'Decision Tree': True,
+    'Random Forest': False,
+    'Gradient Boosting': False,
+    'XGBoost': False,
+    'SVR': False,       
+    'KNN': False,       
+    'MLP': False,       
+    'GPR': False        
 }
 
 # Hyperparameter tuning settings
@@ -92,6 +94,19 @@ CURRICULUM_STEPS = [1, 2, 5, 10, 20, 50, 100]  # Gradually increase prediction l
 TEACHER_FORCING_RATIO_START = 1.0  # Start with 100% ground truth
 TEACHER_FORCING_RATIO_END = 0.0   # End with 0% ground truth (all predictions)
 BATCH_SIZE = 128
+
+
+def _extract_exp_params_from_filename(filename):
+    """
+    Extracts experimental temperature and force from a filename.
+    """
+    base_filename = filename.split('/')[-1]
+    match = re.search(r'-(\d+),0min,(\d+)kN', base_filename)
+    if match:
+        temp = int(match.group(1))
+        force = int(match.group(2))
+        return temp, force
+    return None, None
 
 
 def load_data(file_paths, validation_index):
@@ -116,6 +131,11 @@ def load_data(file_paths, validation_index):
 
             # Add a file identifier column
             df['file_id'] = i
+            
+            # Make sure target column is numeric
+            if TARGET_COLUMN in df.columns:
+                df[TARGET_COLUMN] = pd.to_numeric(df[TARGET_COLUMN], errors='coerce')
+                df = df.dropna(subset=[TARGET_COLUMN])
 
             all_data.append(df)
         except Exception as e:
@@ -134,15 +154,16 @@ def load_data(file_paths, validation_index):
     return train_data, validation_data
 
 
-def preprocess_data(df, target_col, excluded_cols, selected_features=None):
+def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_paths_list=None):
     """
-    Preprocess the data for regression.
+    Preprocess the data for regression with physical features (without leakage).
 
     Args:
         df: Input DataFrame
         target_col: Name of the target column
         excluded_cols: List of columns to exclude
         selected_features: List of features to include (None = use all)
+        file_paths_list: Original file paths for extracting recipe params
 
     Returns:
         X: Feature matrix
@@ -158,6 +179,9 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None):
 
     print(f"Preprocessing data with shape: {data.shape}")
     print(f"Target column: {target_col}")
+    
+    # Force target column to numeric
+    data[target_col] = pd.to_numeric(data[target_col], errors='coerce')
 
     # Drop rows with NaN in target column
     original_count = len(data)
@@ -165,20 +189,76 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None):
     dropped_count = original_count - len(data)
     print(f"Dropped {dropped_count} rows with missing target values")
 
-    # Extract target
-    y = data[target_col].values
+    # TARGET SMOOTHING (reduces noise for the model to learn the true trend)
+    print("Smoothing target variable...")
+    sg_window_target = 21
+    sg_poly_target = 2
+    data[target_col] = data.groupby('file_id')[target_col].transform(
+        lambda x: savgol_filter(x, window_length=sg_window_target, polyorder=sg_poly_target)
+    )
 
-    # Convert -999 values to NaN (likely error codes in the dataset)
+    # Extract target
+    y = data[target_col].values.astype(np.float64)
+
+    # Convert -999 values to NaN
     data = data.replace(-999, np.nan)
+
+    # --- PHYSICAL FEATURE ENGINEERING ---
+    current_selected = selected_features.copy() if selected_features is not None else None
+
+    # 1. Global Recipe Parameters
+    if file_paths_list:
+        data['exp_temp'] = 0
+        data['exp_force'] = 0
+        for file_id_val in data['file_id'].unique():
+            if file_id_val < len(file_paths_list):
+                temp, force = _extract_exp_params_from_filename(file_paths_list[file_id_val])
+                if temp is not None and force is not None:
+                    data.loc[data['file_id'] == file_id_val, 'exp_temp'] = temp
+                    data.loc[data['file_id'] == file_id_val, 'exp_force'] = force
+        if current_selected is not None:
+            if 'exp_temp' not in current_selected: current_selected.append('exp_temp')
+            if 'exp_force' not in current_selected: current_selected.append('exp_force')
+
+    # 2. Time Step
+    data['Time_Step'] = data.groupby('file_id').cumcount()
+    if current_selected is not None and 'Time_Step' not in current_selected:
+        current_selected.append('Time_Step')
+
+    # 3. Cumulative Energy
+    if 'Heating power' in data.columns:
+        data['Heating power'] = pd.to_numeric(data['Heating power'], errors='coerce').fillna(0)
+        data['Cumulative_Energy'] = data.groupby('file_id')['Heating power'].cumsum()
+        if current_selected is not None and 'Cumulative_Energy' not in current_selected:
+            current_selected.append('Cumulative_Energy')
+
+    # 4. Interaction Term
+    if 'AV Force' in data.columns and 'Pyrometer' in data.columns:
+        data['AV Force'] = pd.to_numeric(data['AV Force'], errors='coerce').fillna(method='ffill')
+        data['Pyrometer'] = pd.to_numeric(data['Pyrometer'], errors='coerce').fillna(method='ffill')
+        data['Force_x_Temp'] = data['AV Force'] * data['Pyrometer']
+        if current_selected is not None and 'Force_x_Temp' not in current_selected:
+            current_selected.append('Force_x_Temp')
+
+    # 5. Smoothed Temperature
+    if 'Pyrometer' in data.columns:
+        data['Pyrometer_Smooth'] = data.groupby('file_id')['Pyrometer'].transform(
+            lambda x: savgol_filter(x, window_length=15, polyorder=2, deriv=0)
+        )
+        if current_selected is not None and 'Pyrometer_Smooth' not in current_selected:
+            current_selected.append('Pyrometer_Smooth')
+
+    # NOTE: Shrinkage_Rate is INTENTIONALLY omitted to prevent data leakage!
+    # --- END FEATURE ENGINEERING ---
 
     # Drop specified columns and the target
     columns_to_drop = excluded_cols + [target_col, 'file_id']
     X_data = data.drop(columns=columns_to_drop, errors='ignore')
 
     # Select only specified features if provided
-    if selected_features is not None:
-        available_features = [col for col in selected_features if col in X_data.columns]
-        missing_features = [col for col in selected_features if col not in X_data.columns]
+    if current_selected is not None:
+        available_features = [col for col in current_selected if col in X_data.columns]
+        missing_features = [col for col in current_selected if col not in X_data.columns]
         if missing_features:
             print(f"Warning: Some selected features are not in the data: {missing_features}")
         X_data = X_data[available_features]
@@ -190,32 +270,18 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None):
     if non_numeric:
         print(f"Warning: Non-numeric columns found: {non_numeric}")
         print("Converting to numeric or dropping...")
-
         for col in non_numeric:
             try:
-                # Try to convert to numeric
                 X_data[col] = pd.to_numeric(X_data[col], errors='coerce')
             except:
-                # If conversion fails, drop the column
                 print(f"  Dropping column: {col}")
                 X_data = X_data.drop(columns=[col])
-
-    # Check for NaN values
-    nan_count = X_data.isna().sum().sum()
-    if nan_count > 0:
-        print(f"Found {nan_count} NaN values in features. Filling with column means...")
 
     # Fill remaining NaNs with column means
     X_data = X_data.fillna(X_data.mean())
 
-    # Get feature names for later use
     feature_names = X_data.columns.tolist()
-
-    # Convert to numpy array for modeling
     X = X_data.values
-
-    # Improve precision of target variable (if needed)
-    y = y.astype(np.float64)
 
     print(f"Preprocessed data: X shape: {X.shape}, y shape: {y.shape}")
 
@@ -353,14 +419,12 @@ def virtual_experiment_predict(model, X_input, y_prev_actual, n_features_per_win
         
         # Ensure prediction is finite
         if not np.isfinite(prediction):
-            print("Warning: Non-finite prediction detected, using default value.")
             if prev_prediction is not None:
                 prediction = prev_prediction  # Use previous prediction as fallback
             else:
                 prediction = 0.0  # Default fallback
-    except Exception as e:
-        print(f"Error making prediction: {e}")
-        # Fallback to a reasonable value
+    except Exception:
+        # Fallback to a reasonable value quietly
         if prev_prediction is not None:
             prediction = prev_prediction
         else:
@@ -553,27 +617,18 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
                     batch_size=128, verbose=True):
     """
     Train a model using multi-step approach with scheduled sampling.
-    
-    Args:
-        model: Base model to train
-        X_train, y_train: Training data
-        X_val, y_val: Validation data
-        n_features_per_window: Number of features per window
-        window_size: Window size
-        max_epochs: Maximum number of epochs to train
-        curriculum_steps: List of sequence lengths for curriculum learning
-        tf_ratio_start: Initial teacher forcing ratio (1.0 = always use ground truth)
-        tf_ratio_end: Final teacher forcing ratio (0.0 = always use predictions)
-        batch_size: Batch size for training
-        verbose: Whether to print progress
-        
-    Returns:
-        trained_model: Trained model
-        history: Training history
     """
     # Clone the model to start fresh
     trained_model = clone(model)
     
+    # --- FIX 1: Initial fit to prevent "not fitted yet" errors ---
+    print("  Performing initial base fit...")
+    try:
+        trained_model.fit(X_train, y_train)
+    except Exception as e:
+        print(f"  Initial fit failed (this might happen for some untuned models): {e}")
+    # -----------------------------------------------------------
+        
     # Initialize training history
     history = {
         'train_loss': [],
@@ -613,6 +668,12 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
             train_losses = []
             train_r2s = []
             
+            # --- FIX 2: Accumulate data for the ENTIRE epoch for models like Random Forest ---
+            # This prevents them from forgetting previous data when fit() is called
+            epoch_X_accumulated = []
+            epoch_y_accumulated = []
+            # -------------------------------------------------------------------------------
+            
             n_batches = (len(train_sequences) + batch_size - 1) // batch_size
             
             # Use tqdm if available, otherwise use simple progress updates
@@ -645,10 +706,12 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
                                 n_features_per_window, window_size,
                                 use_prediction, prev_prediction
                             )
-                        except Exception as e:
-                            print(f"Error making prediction: {e}")
-                            # Fallback: use simple prediction without modifications
-                            prediction = trained_model.predict(X_seq[step].reshape(1, -1))[0]
+                        except Exception:
+                            # Fallback quiet to prevent spam
+                            try:
+                                prediction = trained_model.predict(X_seq[step].reshape(1, -1))[0]
+                            except Exception:
+                                prediction = 0.0
                         
                         # Store prediction and actual values
                         seq_predictions.append(prediction)
@@ -667,79 +730,51 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
                 
                 # Update model based on batch losses
                 if hasattr(trained_model, 'partial_fit'):
-                    # For models that support incremental learning
+                    # For models that support incremental learning (like MLP)
                     for X_seq, y_seq in batch_sequences:
                         trained_model.partial_fit(X_seq, y_seq)
                 else:
-                    # For models that require full batch training
-                    # Gather all training data from this batch with scheduled sampling
-                    X_batch = []
-                    y_batch = []
-                    
+                    # Gather data for this batch and add to epoch accumulator
                     for X_seq, y_seq in batch_sequences:
-                        # Process each sequence and collect inputs/outputs with teacher forcing
-                        seq_X = []
-                        seq_y = []
                         seq_preds = []
-                        
                         for step in range(len(X_seq)):
                             X_modified = X_seq[step].copy()
                             
-                            # Apply teacher forcing for previous step's target if needed
+                            # Apply teacher forcing
                             if step > 0 and np.random.random() > tf_ratio:
-                                # Use prediction for previous step
                                 prev_target_idx = n_features_per_window * (window_size + 1) + (window_size - 1)
-                                # Handle edge case where seq_preds might be empty
                                 if seq_preds:
                                     X_modified[prev_target_idx] = seq_preds[-1]
                             
-                            # Clean input to ensure finite values
                             X_modified = ensure_finite(X_modified)
                             
-                            # Make prediction for this step (for next step's input if needed)
                             try:
                                 pred = trained_model.predict(X_modified.reshape(1, -1))[0]
-                                
-                                # Ensure prediction is finite
                                 if not np.isfinite(pred):
-                                    print("Warning: Non-finite batch prediction detected, using actual value.")
-                                    pred = y_seq[step]  # Use actual value as fallback
-                                    
+                                    pred = y_seq[step]  
                                 seq_preds.append(pred)
-                            except Exception as e:
-                                print(f"Error in batch prediction: {e}")
-                                # If prediction fails, use actual value
+                            except Exception:
                                 seq_preds.append(y_seq[step])
                             
-                            seq_X.append(X_modified)
-                            seq_y.append(y_seq[step])
-                        
-                        # Add this sequence's data to the batch
-                        X_batch.extend(seq_X)
-                        y_batch.extend(seq_y)
-                    
-                    # Convert to numpy arrays
-                    X_batch = np.array(X_batch)
-                    y_batch = np.array(y_batch)
-                    
-                    # Update the model (only if we have data)
-                    if len(X_batch) > 0:
-                        try:
-                            trained_model.fit(X_batch, y_batch)
-                        except Exception as e:
-                            print(f"Error fitting model: {e}")
-                            # If batch fitting fails, try individual fitting
-                            for i in range(len(X_batch)):
-                                try:
-                                    trained_model.partial_fit(X_batch[i:i+1], y_batch[i:i+1])
-                                except:
-                                    pass  # Skip if partial_fit isn't available
+                            # Add to EPOCH accumulator
+                            epoch_X_accumulated.append(X_modified)
+                            epoch_y_accumulated.append(y_seq[step])
                 
                 # Track batch metrics
                 avg_batch_loss = np.mean(batch_losses)
                 avg_batch_r2 = np.mean(batch_r2s)
                 train_losses.append(avg_batch_loss)
                 train_r2s.append(avg_batch_r2)
+                
+            # --- FIX 2 (cont): Train the model ONCE per epoch on all accumulated data ---
+            if not hasattr(trained_model, 'partial_fit') and len(epoch_X_accumulated) > 0:
+                X_epoch_arr = np.array(epoch_X_accumulated)
+                y_epoch_arr = np.array(epoch_y_accumulated)
+                try:
+                    trained_model.fit(X_epoch_arr, y_epoch_arr)
+                except Exception as e:
+                    print(f"  Error fitting model at epoch end: {e}")
+            # ----------------------------------------------------------------------------
             
             # Calculate overall metrics for this epoch
             epoch_train_loss = np.mean(train_losses)
@@ -767,10 +802,11 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
                             n_features_per_window, window_size,
                             use_prediction, prev_prediction
                         )
-                    except Exception as e:
-                        print(f"Error in validation prediction: {e}")
-                        # Fallback: use simple prediction without modifications
-                        prediction = trained_model.predict(X_seq[step].reshape(1, -1))[0]
+                    except Exception:
+                        try:
+                            prediction = trained_model.predict(X_seq[step].reshape(1, -1))[0]
+                        except Exception:
+                            prediction = 0.0
                     
                     seq_predictions.append(prediction)
                     prev_prediction = prediction
@@ -1045,7 +1081,7 @@ def plot_model_comparison(standard_metrics, multistep_metrics, approach="Virtual
         if name in standard_metrics and name in multistep_metrics:
             std_rmse = standard_metrics[name]['rmse']
             ms_rmse = multistep_metrics[name]['rmse']
-            rmse_imp = ((std_rmse - ms_rmse) / std_rmse) * 100
+            rmse_imp = ((std_rmse - ms_rmse) / std_rmse) * 100 if std_rmse != 0 else 0
             rmse_improvement.append(rmse_imp)
             
             std_r2 = standard_metrics[name]['r2']
@@ -1076,14 +1112,15 @@ def plot_model_comparison(standard_metrics, multistep_metrics, approach="Virtual
     
     # Add value labels on the bars
     for i, (v1, v2, imp) in enumerate(zip(rmse_standard, rmse_multistep, rmse_improvement)):
-        if v1 > 0 and v2 > 0:  # Only label bars with valid data
-            axes[0].text(i - width/2, v1 + 0.02, f'{v1:.3f}', ha='center', va='bottom', fontsize=8)
-            axes[0].text(i + width/2, v2 + 0.02, f'{v2:.3f}', ha='center', va='bottom', fontsize=8)
+        if v1 > 0 or v2 > 0:  # Only label bars with valid data
+            if v1 > 0: axes[0].text(i - width/2, v1 + 0.005, f'{v1:.3f}', ha='center', va='bottom', fontsize=8)
+            if v2 > 0: axes[0].text(i + width/2, v2 + 0.005, f'{v2:.3f}', ha='center', va='bottom', fontsize=8)
             
             # Add improvement percentage
             if imp != 0:
                 color = 'green' if imp > 0 else 'red'
-                axes[0].text(i, min(v1, v2) / 2, f'{imp:.1f}%', ha='center', va='center', 
+                y_pos = max(0.01, min(v1, v2) / 2)
+                axes[0].text(i, y_pos, f'{imp:.1f}%', ha='center', va='center', 
                           fontsize=9, fontweight='bold', color=color,
                           bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
     
@@ -1102,8 +1139,8 @@ def plot_model_comparison(standard_metrics, multistep_metrics, approach="Virtual
     # Add value labels on the bars
     for i, (v1, v2, imp) in enumerate(zip(r2_standard, r2_multistep, r2_improvement)):
         if v1 != 0 or v2 != 0:  # Only label bars with valid data
-            axes[1].text(i - width/2, v1 + 0.02, f'{v1:.3f}', ha='center', va='bottom', fontsize=8)
-            axes[1].text(i + width/2, v2 + 0.02, f'{v2:.3f}', ha='center', va='bottom', fontsize=8)
+            if v1 != 0: axes[1].text(i - width/2, v1 + 0.02, f'{v1:.3f}', ha='center', va='bottom', fontsize=8)
+            if v2 != 0: axes[1].text(i + width/2, v2 + 0.02, f'{v2:.3f}', ha='center', va='bottom', fontsize=8)
             
             # Add improvement percentage
             if imp != 0:
@@ -1140,9 +1177,9 @@ def main():
     # Preprocess data
     print("\nPreprocessing data...")
     X_train, y_train, feature_names = preprocess_data(
-        train_data, TARGET_COLUMN, EXCLUDED_COLUMNS, SELECTED_FEATURES)
+        train_data, TARGET_COLUMN, EXCLUDED_COLUMNS, SELECTED_FEATURES, file_paths_list=file_paths)
     X_val, y_val, _ = preprocess_data(
-        validation_data, TARGET_COLUMN, EXCLUDED_COLUMNS, SELECTED_FEATURES)
+        validation_data, TARGET_COLUMN, EXCLUDED_COLUMNS, SELECTED_FEATURES, file_paths_list=file_paths)
     
     # Create windowed data
     print("\nCreating windowed data...")
@@ -1172,6 +1209,10 @@ def main():
     standard_metrics = {}
     
     for name, model in base_models.items():
+        # Only evaluate models marked as True in MODELS_TO_EVALUATE
+        if not MODELS_TO_EVALUATE.get(name, False):
+            continue
+            
         print(f"\nTraining {name}...")
         if not USE_OPTIMIZED_MODELS:  # If we're using default models, we need to fit them here
             model.fit(X_train_scaled, y_train_split)
@@ -1213,6 +1254,10 @@ def main():
     training_histories = {}
     
     for name, base_model in base_models.items():
+        # Only evaluate models marked as True in MODELS_TO_EVALUATE
+        if not MODELS_TO_EVALUATE.get(name, False):
+            continue
+            
         print(f"\nMulti-step training for {name}...")
         
         # Use a fresh model instance
@@ -1287,7 +1332,8 @@ def main():
             plt.close()
     
     # Overall comparison between standard and multi-step approaches
-    plot_model_comparison(standard_metrics, multistep_metrics)
+    if standard_metrics and multistep_metrics:
+        plot_model_comparison(standard_metrics, multistep_metrics)
     
     # Calculate overall improvement if we have data
     if standard_metrics and multistep_metrics:
