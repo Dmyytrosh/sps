@@ -71,10 +71,10 @@ MODELS_TO_EVALUATE = {
     'Ridge': False,
     'Lasso': False,
     'ElasticNet': False,
-    'Decision Tree': True,
-    'Random Forest': False,
-    'Gradient Boosting': False,
-    'XGBoost': False,
+    'Decision Tree': False,
+    'Random Forest': True,
+    'Gradient Boosting': True,
+    'XGBoost': True,
     'SVR': False,       
     'KNN': False,       
     'MLP': False,       
@@ -248,11 +248,22 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
         if current_selected is not None and 'Pyrometer_Smooth' not in current_selected:
             current_selected.append('Pyrometer_Smooth')
 
-    # NOTE: Shrinkage_Rate is INTENTIONALLY omitted to prevent data leakage!
+    # 6. HISTORICAL Shrinkage Rate (Сдвинутая скорость усадки)
+    print("Calculating historical Shrinkage Rate...")
+    # Сначала вычисляем саму скорость
+    data['Shrinkage_Rate'] = data.groupby('file_id')[target_col].transform(
+        lambda x: savgol_filter(x, window_length=15, polyorder=2, deriv=1)
+    )
+    # Затем СДВИГАЕМ ее на 1 шаг назад (t-1)
+    data['Prev_Shrinkage_Rate'] = data.groupby('file_id')['Shrinkage_Rate'].shift(1).fillna(0)
+    
+    # Добавляем ТОЛЬКО сдвинутую скорость
+    if current_selected is not None and 'Prev_Shrinkage_Rate' not in current_selected:
+        current_selected.append('Prev_Shrinkage_Rate')
     # --- END FEATURE ENGINEERING ---
 
-    # Drop specified columns and the target
-    columns_to_drop = excluded_cols + [target_col, 'file_id']
+    # Drop specified columns and the target (including the unshifted Shrinkage_Rate!)
+    columns_to_drop = excluded_cols + [target_col, 'file_id', 'Shrinkage_Rate']
     X_data = data.drop(columns=columns_to_drop, errors='ignore')
 
     # Select only specified features if provided
@@ -621,13 +632,12 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
     # Clone the model to start fresh
     trained_model = clone(model)
     
-    # --- FIX 1: Initial fit to prevent "not fitted yet" errors ---
+    # --- ВОЗВРАЩЕНО К СТАРОМУ ВАРИАНТУ (КАК ВЫ ПРОСИЛИ) ---
     print("  Performing initial base fit...")
     try:
         trained_model.fit(X_train, y_train)
     except Exception as e:
-        print(f"  Initial fit failed (this might happen for some untuned models): {e}")
-    # -----------------------------------------------------------
+        print(f"  Initial fit failed: {e}")
         
     # Initialize training history
     history = {
@@ -668,18 +678,9 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
             train_losses = []
             train_r2s = []
             
-            # --- FIX 2: Accumulate data for the ENTIRE epoch for models like Random Forest ---
-            # This prevents them from forgetting previous data when fit() is called
-            epoch_X_accumulated = []
-            epoch_y_accumulated = []
-            # -------------------------------------------------------------------------------
-            
             n_batches = (len(train_sequences) + batch_size - 1) // batch_size
             
-            # Use tqdm if available, otherwise use simple progress updates
             batch_range = tqdm(range(n_batches), desc="Training") if TQDM_AVAILABLE else range(n_batches)
-            if not TQDM_AVAILABLE and n_batches > 10:
-                print(f"Processing {n_batches} batches...")
                 
             for batch_idx in batch_range:
                 batch_start = batch_idx * batch_size
@@ -728,37 +729,74 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
                     r2 = r2_score(seq_actuals, seq_predictions)
                     batch_r2s.append(r2)
                 
-                # Update model based on batch losses
+                # --- ВОЗВРАЩЕНО К СТАРОМУ ВАРИАНТУ (КАК ВЫ ПРОСИЛИ) ---
                 if hasattr(trained_model, 'partial_fit'):
                     # For models that support incremental learning (like MLP)
                     for X_seq, y_seq in batch_sequences:
                         trained_model.partial_fit(X_seq, y_seq)
                 else:
-                    # Gather data for this batch and add to epoch accumulator
+                    # For models that require full batch training
+                    # Gather all training data from this batch with scheduled sampling
+                    X_batch = []
+                    y_batch = []
+                    
                     for X_seq, y_seq in batch_sequences:
+                        # Process each sequence and collect inputs/outputs with teacher forcing
+                        seq_X = []
+                        seq_y = []
                         seq_preds = []
+                        
                         for step in range(len(X_seq)):
                             X_modified = X_seq[step].copy()
                             
-                            # Apply teacher forcing
+                            # Apply teacher forcing for previous step's target if needed
                             if step > 0 and np.random.random() > tf_ratio:
+                                # Use prediction for previous step
                                 prev_target_idx = n_features_per_window * (window_size + 1) + (window_size - 1)
+                                # Handle edge case where seq_preds might be empty
                                 if seq_preds:
                                     X_modified[prev_target_idx] = seq_preds[-1]
                             
+                            # Clean input to ensure finite values
                             X_modified = ensure_finite(X_modified)
                             
+                            # Make prediction for this step (for next step's input if needed)
                             try:
                                 pred = trained_model.predict(X_modified.reshape(1, -1))[0]
+                                
+                                # Ensure prediction is finite
                                 if not np.isfinite(pred):
-                                    pred = y_seq[step]  
+                                    pred = y_seq[step]  # Use actual value as fallback
+                                    
                                 seq_preds.append(pred)
                             except Exception:
+                                # If prediction fails, use actual value
                                 seq_preds.append(y_seq[step])
                             
-                            # Add to EPOCH accumulator
-                            epoch_X_accumulated.append(X_modified)
-                            epoch_y_accumulated.append(y_seq[step])
+                            seq_X.append(X_modified)
+                            seq_y.append(y_seq[step])
+                        
+                        # Add this sequence's data to the batch
+                        X_batch.extend(seq_X)
+                        y_batch.extend(seq_y)
+                    
+                    # Convert to numpy arrays
+                    X_batch = np.array(X_batch)
+                    y_batch = np.array(y_batch)
+                    
+                    # Update the model (only if we have data)
+                    if len(X_batch) > 0:
+                        try:
+                            # ВЫЗОВ FIT НА КАЖДОМ БАТЧЕ (КАК ВЫ ПРОСИЛИ)
+                            trained_model.fit(X_batch, y_batch)
+                        except Exception as e:
+                            # Если не вышло, пробуем partial_fit если вдруг есть
+                            for i in range(len(X_batch)):
+                                try:
+                                    trained_model.partial_fit(X_batch[i:i+1], y_batch[i:i+1])
+                                except:
+                                    pass  # Skip if partial_fit isn't available
+                # -----------------------------------------------------------
                 
                 # Track batch metrics
                 avg_batch_loss = np.mean(batch_losses)
@@ -766,15 +804,6 @@ def multi_step_train(model, X_train, y_train, X_val, y_val, n_features_per_windo
                 train_losses.append(avg_batch_loss)
                 train_r2s.append(avg_batch_r2)
                 
-            # --- FIX 2 (cont): Train the model ONCE per epoch on all accumulated data ---
-            if not hasattr(trained_model, 'partial_fit') and len(epoch_X_accumulated) > 0:
-                X_epoch_arr = np.array(epoch_X_accumulated)
-                y_epoch_arr = np.array(epoch_y_accumulated)
-                try:
-                    trained_model.fit(X_epoch_arr, y_epoch_arr)
-                except Exception as e:
-                    print(f"  Error fitting model at epoch end: {e}")
-            # ----------------------------------------------------------------------------
             
             # Calculate overall metrics for this epoch
             epoch_train_loss = np.mean(train_losses)
