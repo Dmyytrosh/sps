@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from sklearn.linear_model import LinearRegression, Ridge, Lasso, ElasticNet
@@ -69,12 +68,12 @@ SELECTED_FEATURES = [
 MODELS_TO_EVALUATE = {
     'Linear Regression': False,
     'Ridge': False,
-    'Lasso': False,
+    'Lasso': True,
     'ElasticNet': False,
     'Decision Tree': False,
-    'Random Forest': True,
-    'Gradient Boosting': True,
-    'XGBoost': True,
+    'Random Forest': False,
+    'Gradient Boosting': False,
+    'XGBoost': False,
     'SVR': False,       
     'KNN': False,       
     'MLP': False,       
@@ -82,9 +81,9 @@ MODELS_TO_EVALUATE = {
 }
 
 # Hyperparameter tuning settings
-TUNING_METHOD = 'random'  # 'grid', 'random', 'bayesian'
-CV_FOLDS = 3  # Reduced from 5 for faster training
-N_ITER = 10  # Reduced from 20 for faster training
+TUNING_METHOD = 'bayesian'  # 'grid', 'random', 'bayesian'
+CV_FOLDS = 5  # Reduced from 5 for faster training
+N_ITER = 30  # Reduced from 20 for faster training
 USE_OPTIMIZED_MODELS = True  # Whether to use hyperparameter-optimized models
 
 # Multi-step training parameters
@@ -94,6 +93,10 @@ CURRICULUM_STEPS = [1, 2, 5, 10, 20, 50, 100]  # Gradually increase prediction l
 TEACHER_FORCING_RATIO_START = 1.0  # Start with 100% ground truth
 TEACHER_FORCING_RATIO_END = 0.0   # End with 0% ground truth (all predictions)
 BATCH_SIZE = 128
+
+# Ablation flags — disable to compare against baseline without these additions
+ENABLE_TARGET_FILTERING = False    # Apply SG filter to target variable
+ENABLE_FEATURE_ENGINEERING = False # Add physical features (recipe params, Time_Step, energy, etc.)
 
 
 def _extract_exp_params_from_filename(filename):
@@ -189,13 +192,14 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
     dropped_count = original_count - len(data)
     print(f"Dropped {dropped_count} rows with missing target values")
 
-    # TARGET SMOOTHING (reduces noise for the model to learn the true trend)
-    print("Smoothing target variable...")
-    sg_window_target = 21
-    sg_poly_target = 2
-    data[target_col] = data.groupby('file_id')[target_col].transform(
-        lambda x: savgol_filter(x, window_length=sg_window_target, polyorder=sg_poly_target)
-    )
+    if ENABLE_TARGET_FILTERING:
+        # TARGET SMOOTHING (reduces noise for the model to learn the true trend)
+        print("Smoothing target variable...")
+        sg_window_target = 21
+        sg_poly_target = 2
+        data[target_col] = data.groupby('file_id')[target_col].transform(
+            lambda x: savgol_filter(x, window_length=sg_window_target, polyorder=sg_poly_target)
+        )
 
     # Extract target
     y = data[target_col].values.astype(np.float64)
@@ -203,64 +207,62 @@ def preprocess_data(df, target_col, excluded_cols, selected_features=None, file_
     # Convert -999 values to NaN
     data = data.replace(-999, np.nan)
 
-    # --- PHYSICAL FEATURE ENGINEERING ---
     current_selected = selected_features.copy() if selected_features is not None else None
 
-    # 1. Global Recipe Parameters
-    if file_paths_list:
-        data['exp_temp'] = 0
-        data['exp_force'] = 0
-        for file_id_val in data['file_id'].unique():
-            if file_id_val < len(file_paths_list):
-                temp, force = _extract_exp_params_from_filename(file_paths_list[file_id_val])
-                if temp is not None and force is not None:
-                    data.loc[data['file_id'] == file_id_val, 'exp_temp'] = temp
-                    data.loc[data['file_id'] == file_id_val, 'exp_force'] = force
-        if current_selected is not None:
-            if 'exp_temp' not in current_selected: current_selected.append('exp_temp')
-            if 'exp_force' not in current_selected: current_selected.append('exp_force')
+    if ENABLE_FEATURE_ENGINEERING:
+        # --- PHYSICAL FEATURE ENGINEERING ---
 
-    # 2. Time Step
-    data['Time_Step'] = data.groupby('file_id').cumcount()
-    if current_selected is not None and 'Time_Step' not in current_selected:
-        current_selected.append('Time_Step')
+        # 1. Global Recipe Parameters
+        if file_paths_list:
+            data['exp_temp'] = 0
+            data['exp_force'] = 0
+            for file_id_val in data['file_id'].unique():
+                if file_id_val < len(file_paths_list):
+                    temp, force = _extract_exp_params_from_filename(file_paths_list[file_id_val])
+                    if temp is not None and force is not None:
+                        data.loc[data['file_id'] == file_id_val, 'exp_temp'] = temp
+                        data.loc[data['file_id'] == file_id_val, 'exp_force'] = force
+            if current_selected is not None:
+                if 'exp_temp' not in current_selected: current_selected.append('exp_temp')
+                if 'exp_force' not in current_selected: current_selected.append('exp_force')
 
-    # 3. Cumulative Energy
-    if 'Heating power' in data.columns:
-        data['Heating power'] = pd.to_numeric(data['Heating power'], errors='coerce').fillna(0)
-        data['Cumulative_Energy'] = data.groupby('file_id')['Heating power'].cumsum()
-        if current_selected is not None and 'Cumulative_Energy' not in current_selected:
-            current_selected.append('Cumulative_Energy')
+        # 2. Time Step
+        data['Time_Step'] = data.groupby('file_id').cumcount()
+        if current_selected is not None and 'Time_Step' not in current_selected:
+            current_selected.append('Time_Step')
 
-    # 4. Interaction Term
-    if 'AV Force' in data.columns and 'Pyrometer' in data.columns:
-        data['AV Force'] = pd.to_numeric(data['AV Force'], errors='coerce').fillna(method='ffill')
-        data['Pyrometer'] = pd.to_numeric(data['Pyrometer'], errors='coerce').fillna(method='ffill')
-        data['Force_x_Temp'] = data['AV Force'] * data['Pyrometer']
-        if current_selected is not None and 'Force_x_Temp' not in current_selected:
-            current_selected.append('Force_x_Temp')
+        # 3. Cumulative Energy
+        if 'Heating power' in data.columns:
+            data['Heating power'] = pd.to_numeric(data['Heating power'], errors='coerce').fillna(0)
+            data['Cumulative_Energy'] = data.groupby('file_id')['Heating power'].cumsum()
+            if current_selected is not None and 'Cumulative_Energy' not in current_selected:
+                current_selected.append('Cumulative_Energy')
 
-    # 5. Smoothed Temperature
-    if 'Pyrometer' in data.columns:
-        data['Pyrometer_Smooth'] = data.groupby('file_id')['Pyrometer'].transform(
-            lambda x: savgol_filter(x, window_length=15, polyorder=2, deriv=0)
+        # 4. Interaction Term
+        if 'AV Force' in data.columns and 'Pyrometer' in data.columns:
+            data['AV Force'] = pd.to_numeric(data['AV Force'], errors='coerce').fillna(method='ffill')
+            data['Pyrometer'] = pd.to_numeric(data['Pyrometer'], errors='coerce').fillna(method='ffill')
+            data['Force_x_Temp'] = data['AV Force'] * data['Pyrometer']
+            if current_selected is not None and 'Force_x_Temp' not in current_selected:
+                current_selected.append('Force_x_Temp')
+
+        # 5. Smoothed Temperature
+        if 'Pyrometer' in data.columns:
+            data['Pyrometer_Smooth'] = data.groupby('file_id')['Pyrometer'].transform(
+                lambda x: savgol_filter(x, window_length=15, polyorder=2, deriv=0)
+            )
+            if current_selected is not None and 'Pyrometer_Smooth' not in current_selected:
+                current_selected.append('Pyrometer_Smooth')
+
+        # 6. HISTORICAL Shrinkage Rate (Сдвинутая скорость усадки)
+        print("Calculating historical Shrinkage Rate...")
+        data['Shrinkage_Rate'] = data.groupby('file_id')[target_col].transform(
+            lambda x: savgol_filter(x, window_length=15, polyorder=2, deriv=1)
         )
-        if current_selected is not None and 'Pyrometer_Smooth' not in current_selected:
-            current_selected.append('Pyrometer_Smooth')
-
-    # 6. HISTORICAL Shrinkage Rate (Сдвинутая скорость усадки)
-    print("Calculating historical Shrinkage Rate...")
-    # Сначала вычисляем саму скорость
-    data['Shrinkage_Rate'] = data.groupby('file_id')[target_col].transform(
-        lambda x: savgol_filter(x, window_length=15, polyorder=2, deriv=1)
-    )
-    # Затем СДВИГАЕМ ее на 1 шаг назад (t-1)
-    data['Prev_Shrinkage_Rate'] = data.groupby('file_id')['Shrinkage_Rate'].shift(1).fillna(0)
-    
-    # Добавляем ТОЛЬКО сдвинутую скорость
-    if current_selected is not None and 'Prev_Shrinkage_Rate' not in current_selected:
-        current_selected.append('Prev_Shrinkage_Rate')
-    # --- END FEATURE ENGINEERING ---
+        data['Prev_Shrinkage_Rate'] = data.groupby('file_id')['Shrinkage_Rate'].shift(1).fillna(0)
+        if current_selected is not None and 'Prev_Shrinkage_Rate' not in current_selected:
+            current_selected.append('Prev_Shrinkage_Rate')
+        # --- END FEATURE ENGINEERING ---
 
     # Drop specified columns and the target (including the unshifted Shrinkage_Rate!)
     columns_to_drop = excluded_cols + [target_col, 'file_id', 'Shrinkage_Rate']
@@ -1215,16 +1217,10 @@ def main():
     X_train_window, y_train_window = prepare_window_data(X_train, y_train, WINDOW_SIZE)
     X_val_window, y_val_window = prepare_window_data(X_val, y_val, WINDOW_SIZE)
     
-    # Split data for initial training
-    print("\nSplitting data...")
-    X_train_split, X_test, y_train_split, y_test = train_test_split(
-        X_train_window, y_train_window, test_size=0.2, random_state=42)
-    
     # Scale the data
     print("\nScaling data...")
     scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train_split)
-    X_test_scaled = scaler.transform(X_test)
+    X_train_scaled = scaler.fit_transform(X_train_window)
     X_val_scaled = scaler.transform(X_val_window)
     
     # Train models with standard approach first
@@ -1233,22 +1229,18 @@ def main():
     model_status = "optimized" if USE_OPTIMIZED_MODELS else "default"
     print(f"Using {model_status} hyperparameters")
     
-    base_models = create_base_models(X_train_scaled, y_train_split, USE_OPTIMIZED_MODELS)
+    base_models = create_base_models(X_train_scaled, y_train_window, USE_OPTIMIZED_MODELS)
     standard_models = {}
     standard_metrics = {}
-    
+
     for name, model in base_models.items():
         # Only evaluate models marked as True in MODELS_TO_EVALUATE
         if not MODELS_TO_EVALUATE.get(name, False):
             continue
-            
+
         print(f"\nTraining {name}...")
         if not USE_OPTIMIZED_MODELS:  # If we're using default models, we need to fit them here
-            model.fit(X_train_scaled, y_train_split)
-        
-        # Evaluate on test set
-        test_metrics, _ = evaluate_model(model, X_test_scaled, y_test, name)
-        print(f"  Test - RMSE: {test_metrics['rmse']:.4f}, R²: {test_metrics['r2']:.4f}")
+            model.fit(X_train_scaled, y_train_window)
         
         # Run virtual experiment
         print(f"Running virtual experiment for {name}...")
@@ -1294,11 +1286,11 @@ def main():
         
         # First fit with standard approach to have a starting point
         if not USE_OPTIMIZED_MODELS:  # Only need to refit if we're using default models
-            model_to_train.fit(X_train_scaled, y_train_split)
+            model_to_train.fit(X_train_scaled, y_train_window)
         
         # Then apply multi-step training
         trained_model, history = multi_step_train(
-            model_to_train, X_train_scaled, y_train_split, X_val_scaled, y_val_window,
+            model_to_train, X_train_scaled, y_train_window, X_val_scaled, y_val_window,
             n_features_per_window, WINDOW_SIZE,
             max_epochs=MAX_EPOCHS, 
             curriculum_steps=CURRICULUM_STEPS,
